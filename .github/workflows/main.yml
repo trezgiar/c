@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "3 13,21 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-chain
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 270
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare folders
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path C:\9Hits -Force | Out-Null
+          New-Item -ItemType Directory -Path C:\9Hits\logs -Force | Out-Null
+
+      # 📦 КЭШ
+      - name: Cache ZIPs
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\9Hits\hits.zip
+            C:\9Hits\9hits-app-state.zip
+          key: zips-static-v1
+          restore-keys: |
+            zips-static-
+
+      # ⬇️ скачивание только при отсутствии
+      - name: Download hits.zip if not cached
+        shell: powershell
+        run: |
+          if (!(Test-Path "C:\9Hits\hits.zip")) {
+            Invoke-WebRequest "https://bit.ly/3NZcCcZ" -OutFile "C:\9Hits\hits.zip"
+          } else {
+            Write-Host "hits.zip from cache"
+          }
+
+      - name: Download state if not cached
+        shell: powershell
+        run: |
+          if (!(Test-Path "C:\9Hits\9hits-app-state.zip")) {
+            Invoke-WebRequest "https://files.catbox.moe/46rbpt.zip" -OutFile "C:\9Hits\9hits-app-state.zip"
+          } else {
+            Write-Host "state zip from cache"
+          }
+
+      - name: Setup 9Hits
+        shell: powershell
+        run: |
+          $exe = Get-ChildItem C:\9Hits -Recurse -Filter "9hits.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if (!$exe) {
+            Expand-Archive "C:\9Hits\hits.zip" C:\9Hits -Force
+          }
+
+      - name: Restore 9Hits state
+        shell: powershell
+        run: |
+          $local="$env:LOCALAPPDATA\9hits-app"
+          $tmp="C:\9Hits\temp"
+
+          Remove-Item $local -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+
+          New-Item $local -ItemType Directory -Force | Out-Null
+          New-Item $tmp -ItemType Directory -Force | Out-Null
+
+          Expand-Archive "C:\9Hits\9hits-app-state.zip" $tmp -Force
+
+          if (Test-Path "$tmp\9hits-app") {
+            Copy-Item "$tmp\9hits-app\*" $local -Recurse -Force
+          } else {
+            Copy-Item "$tmp\*" $local -Recurse -Force
+          }
+
+          Remove-Item $tmp -Recurse -Force
+
+          # пауза после восстановления
+          Start-Sleep -Seconds 10
+
+      - name: Run with health check + graceful stop
+        shell: powershell
+        run: |
+          $exe = Get-ChildItem C:\9Hits -Recurse -Filter "9hits.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if (!$exe) {
+            Write-Host "9hits.exe not found"
+            exit 1
+          }
+
+          $exePath = $exe.FullName
+          $proc = $null
+
+          # ⏱ 4 часа
+          $end = (Get-Date).AddHours(4)
+
+          function Start-App {
+            param([string]$Path)
+
+            Write-Host "Starting 9hits..."
+            $p = Start-Process -FilePath $Path -PassThru
+            Start-Sleep -Seconds 20
+
+            if ($p.HasExited) {
+              Write-Host "Process exited too early with code $($p.ExitCode)"
+              return $null
+            }
+
+            Write-Host "9hits started, pid=$($p.Id)"
+            return $p
+          }
+
+          try {
+            $proc = Start-App -Path $exePath
+            if (!$proc) { exit 1 }
+
+            while ((Get-Date) -lt $end) {
+
+              if ($proc.HasExited) {
+                Write-Host "9hits crashed, restart after cooldown..."
+                Start-Sleep -Seconds 30
+                $proc = Start-App -Path $exePath
+                if (!$proc) { exit 1 }
+              } else {
+                Write-Host "9hits running pid=$($proc.Id)"
+              }
+
+              Start-Sleep -Seconds 20
+            }
+          }
+          finally {
+            if ($proc -and !$proc.HasExited) {
+              Write-Host "Stopping 9hits gracefully..."
+
+              try {
+                $proc.CloseMainWindow() | Out-Null
+              } catch {}
+
+              Start-Sleep -Seconds 15
+
+              if (!$proc.HasExited) {
+                Write-Host "Force kill"
+                try { $proc.Kill() } catch {}
+              }
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+      # 📊 СТАТИСТИКА
+      - name: Resource usage summary
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "Stats"
+
+          $cpuSamples=Get-Counter "\Processor(_Total)\% Processor Time" -SampleInterval 1 -MaxSamples 5
+          $vals=$cpuSamples.CounterSamples | ForEach-Object {$_.CookedValue}
+
+          $cpuAvg=[math]::Round(($vals|Measure-Object -Average).Average,1)
+          $cpuMax=[math]::Round(($vals|Measure-Object -Maximum).Maximum,1)
+
+          $memFree=(Get-Counter "\Memory\Available MBytes").CounterSamples.CookedValue
+          $memTotal=(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1MB
+          $memUsed=$memTotal-$memFree
+
+          Write-Host "CPU avg $cpuAvg%"
+          Write-Host "CPU peak $cpuMax%"
+          Write-Host ("RAM used {0:N2} MB free {1:N2} MB total {2:N2} MB" -f $memUsed,$memFree,$memTotal)
