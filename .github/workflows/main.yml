@@ -51,7 +51,7 @@ jobs:
         shell: powershell
         run: |
           if (!(Test-Path "C:\9Hits\9hits-app-state.zip")) {
-            Invoke-WebRequest "https://files.catbox.moe/46rbpt.zip" -OutFile "C:\9Hits\9hits-app-state.zip"
+            Invoke-WebRequest "https://www.dropbox.com/scl/fi/ross3eb5lex2glvawem83/46rbpt.zip?rlkey=drtqks07eiqugu4z88bdvlebe&st=0hvn9m8o&dl=1" -OutFile "C:\9Hits\9hits-app-state.zip"
           } else {
             Write-Host "state zip from cache"
           }
